@@ -1,0 +1,31 @@
+# --- Konfiguracja NoProxyGuard ---
+
+okaeri:
+  enabled: true
+  url: "https://api.noproxy.okaeri.cloud/v1/"
+  # Twój klucz API Okaeri
+  api-key: "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
+  # Co robimy w przypadku błędu połączenia z API? (true = wpuść gracza, false = wyrzuć)
+  fail-open: true
+
+bypass-api:
+  enabled: true
+  # Adres lokalnego API zwracającego zaufane IP
+  url: "http://localhost:3001/api/active_ips"
+  # Nagłówek autoryzacji do Twojego lokalnego API
+  x-api-key: "sadadsads533211!zz"
+  # Jak często (w sekundach) odświeżać listę zaufanych IP?
+  refresh-interval: 30
+
+whitelist:
+  # Gracze z tymi nickami zawsze wejdą (case-insensitive)
+  nicks:
+    - "Admin1"
+    - "Mod2"
+  # Te adresy IP zawsze wejdą (z configu)
+  ips:
+    - "127.0.0.1"
+
+messages:
+  kick: "&cWykryto polaczenie VPN/Proxy.\n&7Wylacz VPN i sprobuj ponownie."
+  error: "&cBlad weryfikacji polaczenia. Sprobuj pozniej."
