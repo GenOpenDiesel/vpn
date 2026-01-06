@@ -1,0 +1,5 @@
+name: NoProxyGuard
+version: 1.0.0
+main: pl.twojserwer.noproxy.NoProxyPlugin
+api-version: 1.20
+description: Ochrona przed VPN przy uzyciu Okaeri API i lokalnej whitelisty.
