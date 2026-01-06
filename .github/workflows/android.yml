@@ -1,14 +1,20 @@
-name: Build Minecraft Plugin
+name: Build and Release Plugin
 
 on:
   push:
-    branches: [ "master", "main" ]
+    # Uruchamiaj na wszystkich gałęziach (gwiazdki oznaczają dowolną nazwę)
+    branches: [ "**" ]
   pull_request:
-    branches: [ "master", "main" ]
+  # Pozwala też uruchomić ręcznie z zakładki Actions
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    
+    # Nadajemy uprawnienia do zapisu, aby móc stworzyć Release
+    permissions:
+      contents: write
 
     steps:
     - name: Checkout code
@@ -21,12 +27,24 @@ jobs:
         distribution: 'temurin'
         cache: maven
 
-    # Zmieniona komenda: clean (czyści) + -U (wymusza pobranie zależności)
     - name: Build with Maven
+      # Budowanie projektu
       run: mvn -B -U clean package --file pom.xml
 
+    # Krok 1: Standardowy upload jako Artifact (plik zip w szczegółach akcji)
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: NoProxyGuard-Plugin
         path: target/*.jar
+
+    # Krok 2: Automatyczna aktualizacja "Release" (bezpośredni plik .jar do pobrania)
+    - name: Update Latest Release
+      uses: marvinpinto/action-automatic-releases@latest
+      with:
+        repo_token: "${{ secrets.GITHUB_TOKEN }}"
+        automatic_release_tag: "latest"
+        prerelease: true
+        title: "Development Build (Auto)"
+        files: |
+          target/*.jar
