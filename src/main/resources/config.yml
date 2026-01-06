@@ -8,6 +8,13 @@ okaeri:
   # Co robimy w przypadku błędu połączenia z API? (true = wpuść gracza, false = wyrzuć)
   fail-open: true
 
+# Cache wyników sprawdzania (NOWOŚĆ)
+# Pozwala zapamiętać czyste IP i nie odpytywać API przy każdym logowaniu.
+cache:
+  enabled: true
+  # Czas ważności weryfikacji w godzinach
+  duration-hours: 12
+
 bypass-api:
   enabled: true
   # Adres lokalnego API zwracającego zaufane IP
