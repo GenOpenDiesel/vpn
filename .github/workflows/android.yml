@@ -21,8 +21,9 @@ jobs:
         distribution: 'temurin'
         cache: maven
 
+    # Zmieniona komenda: clean (czyści) + -U (wymusza pobranie zależności)
     - name: Build with Maven
-      run: mvn -B package --file pom.xml
+      run: mvn -B -U clean package --file pom.xml
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
