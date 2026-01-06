@@ -29,10 +29,10 @@ public class NoProxyPlugin extends JavaPlugin implements Listener {
     private final HttpClient httpClient = HttpClient.newHttpClient();
     private final Gson gson = new Gson();
 
-    // Cache dla bypass IP (używamy Set dla szybkiego sprawdzania O(1))
+    // Cache dla bypass IP
     private Set<String> cachedBypassIps = ConcurrentHashMap.newKeySet();
 
-    // Cache dla zweryfikowanych IP (IP -> Timestamp wygaśnięcia)
+    // Cache dla zweryfikowanych IP (IP -> Timestamp)
     private final Map<String, Long> verifiedCache = new ConcurrentHashMap<>();
 
     @Override
@@ -40,21 +40,17 @@ public class NoProxyPlugin extends JavaPlugin implements Listener {
         saveDefaultConfig();
         getServer().getPluginManager().registerEvents(this, this);
 
-        // Uruchomienie zadania odświeżania listy bypass (API lokalne)
         if (getConfig().getBoolean("bypass-api.enabled")) {
             int interval = getConfig().getInt("bypass-api.refresh-interval", 60);
             Bukkit.getScheduler().runTaskTimerAsynchronously(this, this::refreshBypassList, 0L, interval * 20L);
         }
 
-        // Zadanie czyszczące cache zweryfikowanych IP (uruchamiane co godzinę)
-        Bukkit.getScheduler().runTaskTimerAsynchronously(this, this::cleanupVerifiedCache, 1200L, 72000L); // 72000 ticków = 1h
-
-        getLogger().info("NoProxyGuard zaladowany! Obsluga cache aktywna.");
+        // Zadanie czyszczące cache co godzinę
+        Bukkit.getScheduler().runTaskTimerAsynchronously(this, this::cleanupVerifiedCache, 1200L, 72000L);
+        
+        getLogger().info("NoProxyGuard zaladowany! Cache aktywny.");
     }
 
-    /**
-     * Usuwa przeterminowane wpisy z cache zweryfikowanych IP.
-     */
     private void cleanupVerifiedCache() {
         long now = System.currentTimeMillis();
         int removed = 0;
@@ -70,9 +66,6 @@ public class NoProxyPlugin extends JavaPlugin implements Listener {
         }
     }
 
-    /**
-     * Pobiera listę IP z lokalnego API i zapisuje w pamięci podręcznej.
-     */
     private void refreshBypassList() {
         String url = getConfig().getString("bypass-api.url");
         String apiKey = getConfig().getString("bypass-api.x-api-key");
@@ -93,16 +86,12 @@ public class NoProxyPlugin extends JavaPlugin implements Listener {
                     JsonArray ips = json.getAsJsonArray("ips");
                     Set<String> newSet = new HashSet<>();
                     ips.forEach(element -> newSet.add(element.getAsString()));
-
-                    // Podmieniamy cache
                     this.cachedBypassIps = ConcurrentHashMap.newKeySet();
                     this.cachedBypassIps.addAll(newSet);
                 }
-            } else {
-                getLogger().warning("Blad pobierania bypass IP. Kod: " + response.statusCode());
             }
         } catch (Exception e) {
-            getLogger().warning("Wyjatek podczas pobierania bypass IP: " + e.getMessage());
+            getLogger().warning("Blad pobierania bypass IP: " + e.getMessage());
         }
     }
 
@@ -111,29 +100,22 @@ public class NoProxyPlugin extends JavaPlugin implements Listener {
         String ip = event.getAddress().getHostAddress();
         String nick = event.getName();
 
-        // 1. Sprawdzenie Whitelisty z Configu (Nick)
         List<String> whiteNicks = getConfig().getStringList("whitelist.nicks");
         for (String whiteNick : whiteNicks) {
-            if (whiteNick.equalsIgnoreCase(nick)) return; // Wpuszczamy
+            if (whiteNick.equalsIgnoreCase(nick)) return;
         }
 
-        // 2. Sprawdzenie Whitelisty z Configu (IP)
         if (getConfig().getStringList("whitelist.ips").contains(ip)) return;
-
-        // 3. Sprawdzenie Cache z lokalnego API (Bardzo szybkie)
         if (cachedBypassIps.contains(ip)) return;
 
-        // 4. NOWOŚĆ: Sprawdzenie Cache Zweryfikowanych (12h)
-        // Jeśli IP jest w cache i czas nie minął, wpuszczamy bez pytania API
+        // Cache sprawdzania
         if (getConfig().getBoolean("cache.enabled", true)) {
             Long expirationTime = verifiedCache.get(ip);
             if (expirationTime != null && System.currentTimeMillis() < expirationTime) {
-                // getLogger().info("Gracz " + nick + " wpuszczony z cache (wazny do " + expirationTime + ")");
                 return;
             }
         }
 
-        // 5. Sprawdzenie w Okaeri (tylko jeśli nie przeszedł wcześniejszych weryfikacji)
         if (getConfig().getBoolean("okaeri.enabled")) {
             checkOkaeri(event, ip);
         }
@@ -149,7 +131,7 @@ public class NoProxyPlugin extends JavaPlugin implements Listener {
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(fullUrl))
                     .header("Authorization", "Bearer " + token)
-                    .timeout(Duration.ofSeconds(3)) // Krótki timeout
+                    .timeout(Duration.ofSeconds(3))
                     .GET()
                     .build();
 
@@ -158,15 +140,14 @@ public class NoProxyPlugin extends JavaPlugin implements Listener {
             if (response.statusCode() == 200) {
                 JsonObject json = gson.fromJson(response.body(), JsonObject.class);
                 JsonObject suggestions = json.getAsJsonObject("suggestions");
-
                 boolean shouldBlock = suggestions.has("block") && suggestions.get("block").getAsBoolean();
 
                 if (shouldBlock) {
-                    event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER,
+                    event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER, 
                             color(getConfig().getString("messages.kick")));
-                    getLogger().info("Zablokowano polaczenie VPN: " + event.getName() + " (" + ip + ")");
+                    getLogger().info("Zablokowano VPN: " + event.getName() + " (" + ip + ")");
                 } else {
-                    // Jeśli gracz jest czysty -> dodajemy go do cache na X godzin
+                    // Dodaj do cache
                     if (getConfig().getBoolean("cache.enabled", true)) {
                         long hours = getConfig().getInt("cache.duration-hours", 12);
                         long expiration = System.currentTimeMillis() + (hours * 60 * 60 * 1000L);
@@ -174,19 +155,17 @@ public class NoProxyPlugin extends JavaPlugin implements Listener {
                     }
                 }
             } else {
-                getLogger().warning("Okaeri API zwrocilo blad: " + response.statusCode());
                 handleFailOpen(event);
             }
-
         } catch (Exception e) {
-            getLogger().log(Level.SEVERE, "Blad polaczenia z Okaeri API", e);
+            getLogger().log(Level.SEVERE, "Blad Okaeri", e);
             handleFailOpen(event);
         }
     }
 
     private void handleFailOpen(AsyncPlayerPreLoginEvent event) {
         if (!getConfig().getBoolean("okaeri.fail-open")) {
-            event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER,
+            event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER, 
                     color(getConfig().getString("messages.error")));
         }
     }
