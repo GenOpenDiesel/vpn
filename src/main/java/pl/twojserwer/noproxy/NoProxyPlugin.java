@@ -8,6 +8,7 @@ import org.bukkit.ChatColor;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
@@ -37,51 +38,40 @@ public class NoProxyPlugin extends JavaPlugin implements Listener, CommandExecut
     private final HttpClient httpClient = HttpClient.newHttpClient();
     private final Gson gson = new Gson();
 
-    // Cache dla bypass IP (whitelist z API)
+    // Cache
     private volatile Set<String> cachedBypassIps = ConcurrentHashMap.newKeySet();
-
-    // Cache dla zweryfikowanych IP (IP -> Timestamp) - Dobre IP
     private final Map<String, Long> verifiedCache = new ConcurrentHashMap<>();
-
-    // Cache dla zablokowanych IP (IP -> Timestamp) - Złe IP
     private final Map<String, Long> blockedCache = new ConcurrentHashMap<>();
 
-    // Plik i konfiguracja banów
+    // --- SYSTEM BANOWANIA (TRACKING) ---
     private File bansFile;
     private FileConfiguration bansConfig;
+    
+    // Mapa IP -> Nick (szybkie sprawdzanie czy IP jest zajęte)
+    private final Map<String, String> ipLocks = new ConcurrentHashMap<>();
 
     @Override
     public void onEnable() {
         saveDefaultConfig();
-        
-        // Inicjalizacja pliku bans.yml
         createBansConfig();
+        loadBansIntoMemory(); // Ładowanie blokad do pamięci
 
-        // Rejestracja komendy
         getCommand("vpn").setExecutor(this);
 
-        // 1. Najpierw pobierz whitelistę (synchronicznie), aby nie blokować graczy na starcie
+        // Whitelista
         if (getConfig().getBoolean("bypass-api.enabled")) {
-            getLogger().info("Pobieranie whitelisty z API (start)...");
-            refreshBypassList(); // Wywołanie bezpośrednie (blokujące)
-        }
-
-        // Rejestracja zdarzeń
-        getServer().getPluginManager().registerEvents(this, this);
-
-        // Uruchomienie cyklicznego odświeżania (asynchronicznie)
-        if (getConfig().getBoolean("bypass-api.enabled")) {
+            refreshBypassList();
             int interval = getConfig().getInt("bypass-api.refresh-interval", 60);
             Bukkit.getScheduler().runTaskTimerAsynchronously(this, this::refreshBypassList, interval * 20L, interval * 20L);
         }
 
-        // Zadanie czyszczące cache
+        getServer().getPluginManager().registerEvents(this, this);
         Bukkit.getScheduler().runTaskTimerAsynchronously(this, this::cleanupCaches, 1200L, 72000L);
         
-        getLogger().info("NoProxyGuard zaladowany! System banowania aktywny.");
+        getLogger().info("NoProxyGuard v1.2.0 zaladowany! System Tracking IP aktywny.");
     }
 
-    // --- Obsługa bans.yml ---
+    // --- Konfiguracja bans.yml ---
     private void createBansConfig() {
         bansFile = new File(getDataFolder(), "bans.yml");
         if (!bansFile.exists()) {
@@ -98,11 +88,30 @@ public class NoProxyPlugin extends JavaPlugin implements Listener, CommandExecut
         try {
             bansConfig.save(bansFile);
         } catch (IOException e) {
-            getLogger().severe("Nie udalo sie zapisac bans.yml!");
+            e.printStackTrace();
         }
     }
 
-    // --- Obsługa Komend ---
+    // Ładuje aktywne blokady do mapy ipLocks dla szybkiego dostępu
+    private void loadBansIntoMemory() {
+        ipLocks.clear();
+        ConfigurationSection section = bansConfig.getConfigurationSection("tracked");
+        if (section == null) return;
+
+        long now = System.currentTimeMillis();
+        for (String user : section.getKeys(false)) {
+            String ip = section.getString(user + ".ip");
+            long expires = section.getLong(user + ".expires", 0);
+
+            // Jeśli blokada jest ważna i ma IP, dodaj do mapy
+            if (ip != null && !ip.isEmpty() && now < expires) {
+                ipLocks.put(ip, user);
+            }
+        }
+        getLogger().info("Zaladowano " + ipLocks.size() + " aktywnych blokad IP.");
+    }
+
+    // --- Komendy /vpn ban & unban ---
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (!sender.hasPermission("noproxy.admin")) {
@@ -111,110 +120,178 @@ public class NoProxyPlugin extends JavaPlugin implements Listener, CommandExecut
         }
 
         if (args.length == 0) {
-            sender.sendMessage(color("&cUzycie:"));
-            sender.sendMessage(color("&c/vpn ban <nick> <powod> &7- Blokuje IP gracza dla innych"));
-            sender.sendMessage(color("&c/vpn unban <nick> &7- Zdejmuje blokade IP przypisana do gracza"));
+            sender.sendMessage(color("&cUzycie: /vpn <ban/unban> <nick> [powod]"));
             return true;
         }
 
-        // /vpn ban <nick> <powod>
+        // BAN: Dodaje gracza do śledzonych
         if (args[0].equalsIgnoreCase("ban")) {
-            if (args.length < 3) {
-                sender.sendMessage(color("&cPodaj nick i powod! Przyklad: /vpn ban Player1 Alt-Konto"));
+            if (args.length < 2) {
+                sender.sendMessage(color("&cPodaj nick! /vpn ban <nick> [powod]"));
                 return true;
             }
-
             String targetName = args[1];
-            
-            // Budowanie powodu ze spacji
-            StringBuilder reasonBuilder = new StringBuilder();
-            for (int i = 2; i < args.length; i++) reasonBuilder.append(args[i]).append(" ");
-            String reason = reasonBuilder.toString().trim();
+            String reason = (args.length > 2) ? String.join(" ", args).substring(args[0].length() + args[1].length() + 2) : "Banned";
 
+            // Sprawdź czy gracz jest online, aby od razu zablokować jego IP
             Player target = Bukkit.getPlayer(targetName);
-            if (target == null) {
-                sender.sendMessage(color("&cGracz " + targetName + " musi byc online, aby pobrac jego IP!"));
-                return true;
-            }
+            String currentIp = (target != null) ? target.getAddress().getAddress().getHostAddress() : null;
 
-            String ip = target.getAddress().getAddress().getHostAddress();
-            String ipKey = ip.replace(".", "_");
+            long durationDays = getConfig().getInt("bans.duration-days", 3);
+            long expires = System.currentTimeMillis() + (durationDays * 24 * 60 * 60 * 1000L);
 
             // Zapis do bans.yml
-            bansConfig.set("bans." + ipKey + ".user", targetName);
-            bansConfig.set("bans." + ipKey + ".reason", reason);
+            bansConfig.set("tracked." + targetName + ".reason", reason);
+            bansConfig.set("tracked." + targetName + ".expires", expires);
+            
+            if (currentIp != null) {
+                bansConfig.set("tracked." + targetName + ".ip", currentIp);
+                ipLocks.put(currentIp, targetName); // Aktualizacja mapy w pamięci
+                sender.sendMessage(color("&aRozpoczeto sledzenie gracza &e" + targetName + "&a. Zablokowano IP: &e" + currentIp));
+            } else {
+                bansConfig.set("tracked." + targetName + ".ip", ""); // Puste IP, zaktualizuje się przy wejściu
+                sender.sendMessage(color("&aDodano gracza &e" + targetName + " &ado listy. IP zostanie zablokowane przy jego wejsciu."));
+            }
             saveBansConfig();
-
-            sender.sendMessage(color("&aZablokowano IP &e" + ip + " &adla wszystkich OPROCZ gracza &e" + targetName));
             return true;
         }
 
-        // /vpn unban <nick>
+        // UNBAN: Usuwa gracza ze śledzonych i zwalnia IP
         if (args[0].equalsIgnoreCase("unban")) {
             if (args.length < 2) {
-                sender.sendMessage(color("&cPodaj nick gracza, ktorego IP chcesz odblokowac!"));
+                sender.sendMessage(color("&cPodaj nick!"));
                 return true;
             }
             String targetName = args[1];
-            boolean found = false;
 
-            if (bansConfig.getConfigurationSection("bans") != null) {
-                for (String key : bansConfig.getConfigurationSection("bans").getKeys(false)) {
-                    String assignedUser = bansConfig.getString("bans." + key + ".user");
-                    if (assignedUser != null && assignedUser.equalsIgnoreCase(targetName)) {
-                        bansConfig.set("bans." + key, null); // Usunięcie sekcji
-                        found = true;
-                    }
+            if (bansConfig.contains("tracked." + targetName)) {
+                // Usuń z mapy pamięci
+                String savedIp = bansConfig.getString("tracked." + targetName + ".ip");
+                if (savedIp != null && ipLocks.containsKey(savedIp) && ipLocks.get(savedIp).equals(targetName)) {
+                    ipLocks.remove(savedIp);
                 }
-            }
 
-            if (found) {
+                // Usuń z pliku
+                bansConfig.set("tracked." + targetName, null);
                 saveBansConfig();
-                sender.sendMessage(color("&aZdjeto blokady IP przypisane do gracza &e" + targetName));
+                sender.sendMessage(color("&aGracz &e" + targetName + " &anie jest juz sledzony. IP odblokowane."));
             } else {
-                sender.sendMessage(color("&cNie znaleziono blokad IP przypisanych do nicku &e" + targetName));
+                sender.sendMessage(color("&cNie znaleziono gracza &e" + targetName + " &aw bazie blokad."));
             }
             return true;
         }
-
         return true;
     }
 
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onPreLogin(AsyncPlayerPreLoginEvent event) {
+        String ip = event.getAddress().getHostAddress();
+        String nick = event.getName();
+        long now = System.currentTimeMillis();
+
+        // 1. SPRAWDZANIE CZY IP JEST ZAJĘTE PRZEZ INNEGO GRACZA
+        // Sprawdzamy w mapie pamięci (szybko)
+        if (ipLocks.containsKey(ip)) {
+            String owner = ipLocks.get(ip);
+            
+            // Sprawdź czy rezerwacja nie wygasła
+            long expires = bansConfig.getLong("tracked." + owner + ".expires", 0);
+            if (now > expires) {
+                // Wygasła - usuwamy blokadę
+                ipLocks.remove(ip);
+                // Nie usuwamy usera z configu całkowicie, tylko pozwalamy IP zwolnić? 
+                // Zgodnie z założeniem "pamiętać 3 dni", jeśli minęło, to IP jest wolne.
+            } else {
+                // Rezerwacja aktywna. Jeśli to nie właściciel -> KICK
+                if (!owner.equalsIgnoreCase(nick)) {
+                    String msg = getConfig().getString("messages.ip-restricted", "&cIP reserved for {USER}").replace("{USER}", owner);
+                    event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_BANNED, color(msg));
+                    return;
+                }
+            }
+        }
+
+        // 2. AKTUALIZACJA TRACKINGU (Jeśli to gracz śledzony wchodzi z nowego lub starego IP)
+        if (bansConfig.contains("tracked." + nick)) {
+            // Przedłużamy czas ważności (3 dni od TERAZ)
+            long durationDays = getConfig().getInt("bans.duration-days", 3);
+            long newExpires = now + (durationDays * 24 * 60 * 60 * 1000L);
+            
+            String oldIp = bansConfig.getString("tracked." + nick + ".ip");
+
+            // Jeśli IP się zmieniło
+            if (!ip.equals(oldIp)) {
+                // Zwolnij stare IP z mapy blokad
+                if (oldIp != null && !oldIp.isEmpty() && ipLocks.getOrDefault(oldIp, "").equals(nick)) {
+                    ipLocks.remove(oldIp);
+                }
+                // Zablokuj nowe IP
+                ipLocks.put(ip, nick);
+                getLogger().info("Zaktualizowano IP dla sledzonego gracza " + nick + ": " + oldIp + " -> " + ip);
+            } else {
+                // To samo IP - upewnij się, że jest w mapie (np. po przeładowaniu)
+                ipLocks.put(ip, nick);
+            }
+
+            // Zapisz zmiany w configu
+            bansConfig.set("tracked." + nick + ".ip", ip);
+            bansConfig.set("tracked." + nick + ".expires", newExpires);
+            saveBansConfig();
+        }
+
+        // DALSZA WERYFIKACJA (Whitelisty, VPN, Okaeri)
+        // Jeśli gracz przeszedł weryfikację "Bans", sprawdzamy go normalnie pod kątem VPN
+        
+        // Whitelista Nicków
+        List<String> whiteNicks = getConfig().getStringList("whitelist.nicks");
+        for (String whiteNick : whiteNicks) {
+            if (whiteNick.equalsIgnoreCase(nick)) return;
+        }
+
+        // Whitelista IP
+        if (getConfig().getStringList("whitelist.ips").contains(ip)) return;
+        if (cachedBypassIps.contains(ip)) return;
+
+        // Cache Zablokowanych
+        Long blockedExpiration = blockedCache.get(ip);
+        if (blockedExpiration != null && now < blockedExpiration) {
+            event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER, color(getConfig().getString("messages.kick")));
+            return;
+        }
+
+        // Okaeri API
+        if (getConfig().getBoolean("okaeri.enabled")) {
+            // Pomijamy sprawdzanie Okaeri dla graczy z verifiedCache
+            Long verifiedExp = verifiedCache.get(ip);
+            if (verifiedExp == null || now > verifiedExp) {
+                checkOkaeri(event, ip);
+            }
+        }
+    }
+
+    // --- Reszta metod bez zmian istotnych ---
+    
     private void cleanupCaches() {
         long now = System.currentTimeMillis();
-        
-        // Czyszczenie verifiedCache
         verifiedCache.entrySet().removeIf(entry -> now > entry.getValue());
-
-        // Czyszczenie blockedCache
         blockedCache.entrySet().removeIf(entry -> now > entry.getValue());
+        
+        // Możemy też czyścić ipLocks z wygasłych wpisów, ale robimy to on-demand przy logowaniu
     }
 
     private void refreshBypassList() {
         String url = getConfig().getString("bypass-api.url");
         String apiKey = getConfig().getString("bypass-api.x-api-key");
-
         try {
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(url))
-                    .header("x-api-key", apiKey)
-                    .timeout(Duration.ofSeconds(5))
-                    .GET()
-                    .build();
-
+            HttpRequest request = HttpRequest.newBuilder().uri(URI.create(url)).header("x-api-key", apiKey).timeout(Duration.ofSeconds(5)).GET().build();
             HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-
             if (response.statusCode() == 200) {
                 JsonObject json = gson.fromJson(response.body(), JsonObject.class);
                 if (json.has("success") && json.get("success").getAsBoolean()) {
                     JsonArray ips = json.getAsJsonArray("ips");
                     Set<String> newSet = new HashSet<>();
                     ips.forEach(element -> newSet.add(element.getAsString()));
-                    
-                    for (String ip : newSet) {
-                        blockedCache.remove(ip);
-                    }
-
+                    for (String ip : newSet) blockedCache.remove(ip);
                     Set<String> concurrentSet = ConcurrentHashMap.newKeySet();
                     concurrentSet.addAll(newSet);
                     this.cachedBypassIps = concurrentSet;
@@ -225,111 +302,34 @@ public class NoProxyPlugin extends JavaPlugin implements Listener, CommandExecut
         }
     }
 
-    @EventHandler(priority = EventPriority.HIGHEST)
-    public void onPreLogin(AsyncPlayerPreLoginEvent event) {
-        String ip = event.getAddress().getHostAddress();
-        String nick = event.getName();
-
-        // 0. SPRAWDZENIE BANÓW NA IP (System "Tylko dla jednego gracza")
-        // Sprawdzamy, czy to IP jest w bazie banów
-        String ipKey = ip.replace(".", "_");
-        if (bansConfig.contains("bans." + ipKey)) {
-            String allowedUser = bansConfig.getString("bans." + ipKey + ".user");
-            
-            // Jeśli nick gracza wchodzącego NIE jest tym dozwolonym -> Blokada
-            if (!nick.equalsIgnoreCase(allowedUser)) {
-                String reason = bansConfig.getString("bans." + ipKey + ".reason", "IP Restricted");
-                event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_BANNED, 
-                        color("&cTo IP jest przypisane wylacznie do gracza: &e" + allowedUser + "\n\n&cPowod: &7" + reason));
-                return;
-            }
-            // Jeśli to ten gracz (allowedUser), to przepuszczamy go dalej
-            // (wciąż może go sprawdzić Okaeri/VPN, ale zakładamy, że właściciel IP ma prawo wejść)
-        }
-
-        // 1. Whitelista Nicków (config)
-        List<String> whiteNicks = getConfig().getStringList("whitelist.nicks");
-        for (String whiteNick : whiteNicks) {
-            if (whiteNick.equalsIgnoreCase(nick)) return;
-        }
-
-        // 2. Whitelista IP (lokalna i z API)
-        if (getConfig().getStringList("whitelist.ips").contains(ip)) return;
-        if (cachedBypassIps.contains(ip)) return;
-
-        // 3. Sprawdzenie Cache ZABLOKOWANYCH
-        Long blockedExpiration = blockedCache.get(ip);
-        if (blockedExpiration != null && System.currentTimeMillis() < blockedExpiration) {
-            event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER, 
-                    color(getConfig().getString("messages.kick")));
-            return;
-        }
-
-        // 4. Sprawdzenie Cache DOBRYCH
-        if (getConfig().getBoolean("cache.enabled", true)) {
-            Long expirationTime = verifiedCache.get(ip);
-            if (expirationTime != null && System.currentTimeMillis() < expirationTime) {
-                return;
-            }
-        }
-
-        // 5. Sprawdzenie w API Okaeri
-        if (getConfig().getBoolean("okaeri.enabled")) {
-            checkOkaeri(event, ip);
-        }
-    }
-
     private void checkOkaeri(AsyncPlayerPreLoginEvent event, String ip) {
         String baseUrl = getConfig().getString("okaeri.url");
         if (!baseUrl.endsWith("/")) baseUrl += "/";
-        String fullUrl = baseUrl + ip;
         String token = getConfig().getString("okaeri.api-key");
 
         try {
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(fullUrl))
-                    .header("Authorization", "Bearer " + token)
-                    .timeout(Duration.ofSeconds(3))
-                    .GET()
-                    .build();
-
+            HttpRequest request = HttpRequest.newBuilder().uri(URI.create(baseUrl + ip)).header("Authorization", "Bearer " + token).timeout(Duration.ofSeconds(3)).GET().build();
             HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
 
             if (response.statusCode() == 200) {
                 JsonObject json = gson.fromJson(response.body(), JsonObject.class);
-                JsonObject suggestions = json.getAsJsonObject("suggestions");
-                boolean shouldBlock = suggestions.has("block") && suggestions.get("block").getAsBoolean();
+                boolean shouldBlock = json.getAsJsonObject("suggestions").get("block").getAsBoolean();
 
                 if (shouldBlock) {
-                    event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER, 
-                            color(getConfig().getString("messages.kick")));
-                    getLogger().info("Zablokowano VPN: " + event.getName() + " (" + ip + ")");
-                    
-                    if (getConfig().getBoolean("cache.enabled", true)) {
-                        long hours = getConfig().getInt("cache.duration-hours", 12);
-                        long expiration = System.currentTimeMillis() + (hours * 60 * 60 * 1000L);
-                        blockedCache.put(ip, expiration);
-                    }
+                    event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER, color(getConfig().getString("messages.kick")));
+                    long hours = getConfig().getInt("cache.duration-hours", 12);
+                    blockedCache.put(ip, System.currentTimeMillis() + (hours * 3600000L));
                 } else {
-                    if (getConfig().getBoolean("cache.enabled", true)) {
-                        long hours = getConfig().getInt("cache.duration-hours", 12);
-                        long expiration = System.currentTimeMillis() + (hours * 60 * 60 * 1000L);
-                        verifiedCache.put(ip, expiration);
-                    }
+                    long hours = getConfig().getInt("cache.duration-hours", 12);
+                    verifiedCache.put(ip, System.currentTimeMillis() + (hours * 3600000L));
                 }
-            } else {
-                handleFailOpen(event);
+            } else if (!getConfig().getBoolean("okaeri.fail-open")) {
+                event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER, color(getConfig().getString("messages.error")));
             }
         } catch (Exception e) {
-            getLogger().log(Level.SEVERE, "Blad Okaeri", e);
-            handleFailOpen(event);
-        }
-    }
-
-    private void handleFailOpen(AsyncPlayerPreLoginEvent event) {
-        if (!getConfig().getBoolean("okaeri.fail-open")) {
-            event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER, 
-                    color(getConfig().getString("messages.error")));
+            if (!getConfig().getBoolean("okaeri.fail-open")) {
+                event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER, color(getConfig().getString("messages.error")));
+            }
         }
     }
 
