@@ -36,3 +36,12 @@ whitelist:
 messages:
   kick: "&cWykryto polaczenie VPN/Proxy.\n&7Wylacz VPN i sprobuj ponownie."
   error: "&cBlad weryfikacji polaczenia. Sprobuj pozniej."
+bans:
+  # Ile dni system ma pamiętać rezerwację IP dla zbanowanego gracza?
+  # Po upływie tego czasu (od ostatniego logowania), IP zostaje zwolnione dla innych.
+  duration-days: 3
+
+messages:
+  kick: "&cWykryto polaczenie VPN/Proxy.\n&7Wylacz VPN i sprobuj ponownie."
+  error: "&cBlad weryfikacji polaczenia. Sprobuj pozniej."
+  ip-restricted: "&cTo IP jest zarezerwowane dla gracza: &e{USER}\n&7Twoj nick sie nie zgadza."
